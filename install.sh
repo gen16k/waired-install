@@ -2,8 +2,8 @@
 # install.sh — install Waired via the system package manager.
 #
 # Usage:
-#   curl -fsSL https://github.com/gen16k/waired/releases/latest/download/install.sh | sh
-#   curl -fsSL https://github.com/gen16k/waired/releases/latest/download/install.sh | sh -s -- --dry-run
+#   curl -fsSL https://github.com/gen16k/waired-install/releases/latest/download/install.sh | sh
+#   curl -fsSL https://github.com/gen16k/waired-install/releases/latest/download/install.sh | sh -s -- --dry-run
 #
 # This script is intentionally OS-agnostic in shape. Today only the
 # Linux + apt path is wired up (Debian / Ubuntu). New operating systems
@@ -26,7 +26,7 @@ set -eu
 
 # GitHub Releases asset URL (hosts install.sh itself). `latest` resolves
 # to the most recent tagged release.
-WAIRED_INSTALL_BASE_URL="${WAIRED_INSTALL_BASE_URL:-https://github.com/gen16k/waired/releases/latest/download}"
+WAIRED_INSTALL_BASE_URL="${WAIRED_INSTALL_BASE_URL:-https://github.com/gen16k/waired-install/releases/latest/download}"
 # Artifact Registry APT endpoint that hosts the actual .deb packages.
 # Repo is publicly readable via roles/artifactregistry.reader on allUsers
 # (see infra/terraform/modules/artifact-registry/main.tf).
@@ -96,8 +96,8 @@ show_help() {
 install.sh — install Waired via the system package manager.
 
 Usage:
-  curl -fsSL https://github.com/gen16k/waired/releases/latest/download/install.sh | sh
-  curl -fsSL https://github.com/gen16k/waired/releases/latest/download/install.sh | sh -s -- --dry-run
+  curl -fsSL https://github.com/gen16k/waired-install/releases/latest/download/install.sh | sh
+  curl -fsSL https://github.com/gen16k/waired-install/releases/latest/download/install.sh | sh -s -- --dry-run
 
 Options:
   --dry-run     show every privileged command without running it
@@ -107,7 +107,7 @@ Environment variables:
   WAIRED_VERSION           pin to a specific package version (e.g. 1.2.3)
   WAIRED_NO_TRAY           if set, do not install waired-tray
   WAIRED_INSTALL_BASE_URL  override URL for install.sh itself
-                           (default: github.com/gen16k/waired releases)
+                           (default: github.com/gen16k/waired-install releases)
   WAIRED_APT_BASE_URL      override the apt repository base URL
                            (default: asia-northeast1-apt.pkg.dev/projects/dev-waired)
   WAIRED_APT_SUITE         override the apt suite (= AR repository id)
