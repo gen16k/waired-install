@@ -2,12 +2,19 @@
 
 Entrypoint installers for **Waired**:
 
-* `install.sh` — Linux (Debian / Ubuntu apt).
+* `install.sh` — Linux (Debian / Ubuntu apt) and macOS 13+ (arm64/amd64).
 * `install.ps1` — Windows 10 1809+ / 11 (PowerShell 5.1+).
 
 ## Quick install
 
 Linux:
+
+```sh
+curl -fsSL https://github.com/gen16k/waired-install/releases/latest/download/install.sh | sh
+```
+
+macOS (run as your normal login user — `sudo` is invoked only for the
+`/usr/local/bin` copy; do not run the whole script under `sudo`):
 
 ```sh
 curl -fsSL https://github.com/gen16k/waired-install/releases/latest/download/install.sh | sh
@@ -27,6 +34,15 @@ What each does:
   (hosted on Google Artifact Registry) and its Google-managed signing
   key, then `apt install`s the `waired` package (CLI + agent daemon)
   and, by default, `waired-tray` (desktop tray UI).
+* **macOS** — downloads `waired-darwin-<arch>.tar.gz` + `.sha256` from
+  this same release, verifies the SHA-256, installs `waired` +
+  `waired-agent` into `/usr/local/bin`, installs **Ollama** (reuses an
+  existing install, otherwise downloads the official `Ollama.app` into
+  `/Applications` — no Homebrew required), and registers a per-user
+  launchd LaunchAgent (`com.waired.agent`) via `waired-agent install`.
+  The binaries are unsigned (ad-hoc); `curl`-downloaded executables
+  carry no Gatekeeper quarantine, so they run without a right-click
+  gesture. Set `WAIRED_NO_OLLAMA=1` to skip the Ollama install.
 * **Windows** — verifies the host is Windows 10 1809+ / amd64,
   downloads `waired-windows-amd64.zip` + `.sha256` from this same
   release, verifies the SHA-256, self-elevates via UAC, stops any
@@ -88,8 +104,16 @@ Shared between `install.sh` and `install.ps1`:
 | Variable                  | Effect                                                                            |
 |---------------------------|-----------------------------------------------------------------------------------|
 | `WAIRED_VERSION`          | Pin to a specific version (Linux: `waired=1.2.3`; Windows: release tag `v1.2.3`). |
-| `WAIRED_NO_TRAY`          | If non-empty, skip `waired-tray`. Use on headless servers.                        |
-| `WAIRED_INSTALL_BASE_URL` | Override URL hosting `install.sh` / `install.ps1` itself (tests / mirrors).       |
+| `WAIRED_NO_TRAY`          | If non-empty, skip `waired-tray` (Linux). Use on headless servers.                |
+| `WAIRED_INSTALL_BASE_URL` | Override URL hosting the scripts + OS binaries (tests / mirrors).                 |
+
+macOS-only:
+
+| Variable                   | Effect                                                                           |
+|----------------------------|----------------------------------------------------------------------------------|
+| `WAIRED_NO_OLLAMA`         | If non-empty, skip the Ollama install (bring your own inference engine).         |
+| `WAIRED_OLLAMA_DARWIN_URL` | Override the `Ollama.app` download URL (pin a version / point at a mirror).       |
+| `WAIRED_DARWIN_BINDIR`     | Override where `waired` / `waired-agent` install. Default `/usr/local/bin`.       |
 
 Linux-only (apt repo metadata):
 
@@ -111,9 +135,10 @@ Windows-only:
 Each `v*` tag in this repository corresponds to a Waired release of the
 same version. The Linux `.deb` packages are distributed via Google
 Artifact Registry; the Windows `.zip` + `.sha256` + Inno Setup `.exe`
-are uploaded as release assets here. This repository hosts the
-installer entrypoints (`install.sh`, `install.ps1`) and — for Windows
-— the binary artifacts themselves.
+and the macOS `waired-darwin-{amd64,arm64}.tar.gz` + `.sha256` are
+uploaded as release assets here. This repository hosts the installer
+entrypoints (`install.sh`, `install.ps1`) and — for Windows and
+macOS — the binary artifacts themselves.
 
 ## After install
 
@@ -125,6 +150,17 @@ installer entrypoints (`install.sh`, `install.ps1`) and — for Windows
 
 Diagnostics:  `journalctl -u waired-agent -e`
 Uninstall:    `sudo apt purge waired waired-tray`
+
+### macOS
+
+* Enroll the device: `waired init --control https://<your-control-plane>`.
+* Start the agent now (it also auto-starts at next login):
+  `launchctl kickstart -k gui/$(id -u)/com.waired.agent`.
+* Ollama is installed as `Ollama.app`; launch it once (`open -a Ollama`)
+  so the `127.0.0.1:11434` server starts. The agent reuses it.
+
+Diagnostics:  `log show --predicate 'process == "waired-agent"' --last 5m`
+Uninstall:    `waired-agent uninstall && sudo rm -f /usr/local/bin/waired /usr/local/bin/waired-agent`
 
 ### Windows
 
@@ -150,11 +186,12 @@ Uninstall:    `& "C:\Program Files\Waired\waired-agent.exe" uninstall` (or Setti
 | Fedora / RHEL         | placeholder — exits with a clear message            |
 | Alpine                | placeholder                                         |
 | Arch / AUR            | placeholder                                         |
-| macOS                 | placeholder (Homebrew tap planned)                  |
+| macOS 13+             | supported (`install.sh`, unsigned ad-hoc tarball)   |
 | Windows 10 1809+ / 11 | supported (`install.ps1` + Inno Setup GUI `.exe`)   |
 
-Architecture matrix: `amd64`, `arm64` on Linux; `amd64` only on Windows
-(arm64 deferred). Anything else exits.
+Architecture matrix: `amd64`, `arm64` on Linux and macOS; `amd64` only
+on Windows (arm64 deferred). Anything else exits. macOS code signing /
+notarization and a Homebrew formula are follow-ups.
 
 ## License
 
