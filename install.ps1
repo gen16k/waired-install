@@ -36,8 +36,34 @@
 .PARAMETER Help
     Print help and exit.
 
+.PARAMETER Dev
+    Pre-configure this install for the built-in dogfood Control Plane
+    (https://app.dev.waired.net). The URL is substituted into the Next-steps
+    `waired.exe init --control "<URL>"` command so enrolment is single-step.
+
+.PARAMETER Control
+    Same as -Dev but with an explicit URL. Takes precedence over -Dev when
+    both are given.
+
+.PARAMETER Edge
+    Install the latest main build (same as WAIRED_VERSION=edge) — rebuilt on
+    every merge to main; NOT a stable release. -Latest is an alias.
+
 .EXAMPLE
     iwr -useb https://github.com/gen16k/waired-install/releases/latest/download/install.ps1 | iex
+
+.EXAMPLE
+    # Latest main build (edge channel)
+    $env:WAIRED_VERSION = 'edge'
+    iwr -useb https://github.com/gen16k/waired-install/releases/latest/download/install.ps1 | iex
+
+.EXAMPLE
+    # Dogfood (dev-main Control Plane). Save to a file first: this avoids the
+    # Windows PowerShell 5.1 octet-stream byte[] pitfall and lets the UAC
+    # self-elevation re-launch the same file with -Dev preserved.
+    $f = "$env:TEMP\waired-install.ps1"
+    iwr -useb https://github.com/gen16k/waired-install/releases/latest/download/install.ps1 -OutFile $f
+    & $f -Dev
 
 .EXAMPLE
     # Pin to a specific tag
@@ -53,6 +79,60 @@
 param(
     [switch]$DryRun,
     [switch]$Help,
+    [switch]$Dev,
+    [string]$Control = '',
+    # Skip the Ollama install. When -Control / -Dev resolved a Control
+    # Plane URL the installer normally fetches scripts/install/ollama-
+    # windows.ps1 from the public mirror and runs it inside Phase 2.
+    # Pass -SkipOllama on headless / low-disk hosts; the operator can
+    # finish later by hand. No-op when no $ControlUrl was resolved (the
+    # installer doesn't auto-install Ollama in that case either).
+    # Equivalent env var: WAIRED_NO_OLLAMA=1 (resolved into $SkipOllama
+    # below) — same skip semantics as install.sh's --skip-ollama /
+    # WAIRED_NO_OLLAMA, so the two installers stay aligned.
+    [switch]$SkipOllama,
+    # Skip the post-SCM `waired init` invocation. When -Control / -Dev
+    # resolved a CP URL the installer normally runs `waired init` so
+    # enrolment is single-step; -SkipInit reverts to the manual-Next-
+    # steps block.
+    [switch]$SkipInit,
+    # Skip enabling the transparent Claude proxy after enrolment. By default
+    # (mirroring the Linux installer) a successful `waired init` enables it: a
+    # "waired Claude proxy CA" root certificate is trusted and api.anthropic.com
+    # is redirected to local inference (fallback: real Anthropic). Pass
+    # -SkipClaudeProxy (or WAIRED_NO_CLAUDE_PROXY=1) to leave Claude Code routed
+    # straight to Anthropic; enable later with an elevated
+    # `waired proxy install --confirm-anthropic`.
+    [switch]$SkipClaudeProxy,
+    # Force `waired init --non-interactive`. Auto-detected when stdin is
+    # redirected (CI / piped through iex with a non-console stdin).
+    [switch]$NonInteractive,
+    # -Check reports whether a newer waired is available and exits;
+    # -Update applies it; -Yes assumes "yes" to the update prompt
+    # (required to update on a non-interactive / no-TTY host). See #292.
+    [switch]$Check,
+    [switch]$Update,
+    [switch]$Yes,
+    # Install the latest main build (same as WAIRED_VERSION=edge) — rebuilt
+    # on every merge to main; NOT a stable release. -Latest is an alias.
+    # Resolved into $Version + $env:WAIRED_VERSION below so the edge
+    # prerelease assets are fetched and the elevated re-invoke tracks the
+    # same channel.
+    [switch]$Edge,
+    [switch]$Latest,
+    # GPU mode forwarded to ollama-windows.ps1 -GpuMode. See that
+    # script's docs for the full enum (auto / rocm / vulkan / cuda-only
+    # / cpu-only).
+    [string]$OllamaGpuMode    = 'auto',
+    # Optional models directory forwarded to ollama-windows.ps1
+    # -ModelsDir. Empty = ollama's built-in default.
+    [string]$OllamaModelsDir  = $env:WAIRED_OLLAMA_MODELS_DIR,
+    # Force `waired init --inference-enabled <true|false>`. Empty = no
+    # override (the prompt or hardware-based default decides).
+    [string]$InferenceEnabled = '',
+    # Force `waired init --share-with-mesh <true|false>`. Empty = no
+    # override.
+    [string]$ShareWithMesh = '',
     # Internal: non-empty when re-invoked elevated by Phase 1 after the
     # download has already happened. Skips re-download and goes straight
     # to the privileged install steps. Not documented in -Help -- callers
@@ -74,17 +154,68 @@ $ProgressPreference    = 'SilentlyContinue'
 $BaseUrl    = if ($env:WAIRED_INSTALL_BASE_URL) { $env:WAIRED_INSTALL_BASE_URL } `
               else { 'https://github.com/gen16k/waired-install/releases' }
 $Version    = if ($env:WAIRED_VERSION) { $env:WAIRED_VERSION } else { 'latest' }
+# -Edge / -Latest: the latest main build. Mirror install.sh's --edge by
+# setting the channel both on $Version (this process) and $env:WAIRED_VERSION
+# (inherited by the elevated re-invoke, which re-resolves $Version from it).
+if ($Edge -or $Latest) {
+    $Version = 'edge'
+    $env:WAIRED_VERSION = 'edge'
+}
+# GitHub repo (owner/name) whose Releases API resolves the stable
+# 'latest' version during -Check / -Update. Mirror of install.sh's
+# WAIRED_INSTALL_REPO. Override alongside WAIRED_INSTALL_BASE_URL for a
+# private/staging mirror.
+$InstallRepo = if ($env:WAIRED_INSTALL_REPO) { $env:WAIRED_INSTALL_REPO } else { 'gen16k/waired-install' }
 $NoTray     = [bool]$env:WAIRED_NO_TRAY
 $StateDir   = $env:WAIRED_STATE_DIR
+
+# WAIRED_NO_OLLAMA is the env-var form of -SkipOllama (mirrors install.sh,
+# where --skip-ollama and WAIRED_NO_OLLAMA are equivalent). Fold it into
+# the switch here so every downstream check (Install-OllamaIfRequested,
+# the elevation re-invoke that forwards -SkipOllama) sees one resolved
+# value regardless of which form the operator used. The env block is also
+# inherited by the elevated child, so the resolution holds across phases.
+if ($env:WAIRED_NO_OLLAMA) { $SkipOllama = $true }
+
+# WAIRED_NO_CLAUDE_PROXY is the env-var form of -SkipClaudeProxy (mirrors the
+# Linux installer's WAIRED_NO_CLAUDE_PROXY / --skip-proxy). Folded into the
+# switch so every downstream check + the elevation re-invoke see one value.
+if ($env:WAIRED_NO_CLAUDE_PROXY) { $SkipClaudeProxy = $true }
+
+# Built-in dogfood Control Plane URL surfaced via -Dev. Script-level only;
+# never compiled into the waired binary (spec §10.4 — binary hash stays
+# identical across environments).
+$DevControlUrl = if ($env:WAIRED_DEV_CONTROL_URL) { $env:WAIRED_DEV_CONTROL_URL } `
+                 else { 'https://app.dev.waired.net' }
+$ControlUrl    = ''   # resolved by Resolve-ControlUrl after param parsing.
 
 $InstallDir  = Join-Path $env:ProgramFiles 'Waired'
 $ServiceName = 'waired-agent'
 $ZipName     = 'waired-windows-amd64.zip'
 $ShaName     = "$ZipName.sha256"
+# SCM-mode state dir; agent.json + identity land here so the
+# LocalSystem-spawned waired-agent service finds them on boot.
+$AgentStateDir = Join-Path $env:ProgramData 'waired'
 
 # -------------------------------------------------------------------
 # common_* helpers (mirror install.sh naming)
 # -------------------------------------------------------------------
+
+# Make emoji in the friendly banners render on modern terminals. Wrapped
+# in try/catch because legacy hosts (or redirected output) may not accept
+# the assignment; Emo falls back to ASCII when emoji can't be shown.
+try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch { }
+
+# Emo <emoji> <ascii-fallback>: emoji on a UTF-8-capable console, else the
+# ASCII fallback. WAIRED_NO_EMOJI forces the fallback.
+function Emo {
+    param([string]$Emoji, [string]$Ascii)
+    if ($env:WAIRED_NO_EMOJI) { return $Ascii }
+    try {
+        if ([Console]::OutputEncoding.CodePage -eq 65001) { return $Emoji }
+    } catch { }
+    return $Ascii
+}
 
 function Common-Log  { param([string]$Msg) Write-Host "[waired] $Msg" -ForegroundColor Cyan }
 function Common-Warn { param([string]$Msg) Write-Host "[waired] $Msg" -ForegroundColor Yellow }
@@ -92,6 +223,69 @@ function Common-Die  {
     param([string]$Msg)
     Write-Host "[waired] $Msg" -ForegroundColor Red
     exit 1
+}
+
+# Show-Banner prints the WAIRED "GATE" splash at the start of a run.
+# Two tiers, mirroring install.sh:
+#   * rich  — a block WAIRED wordmark + GATE emblem ( ● ) with a
+#             blue->cyan 24-bit gradient, on a UTF-8 console that supports
+#             virtual-terminal sequences and is wide enough.
+#   * plain — a figlet ASCII wordmark in cyan, otherwise.
+# Colour is suppressed when output is redirected or NO_COLOR is set. The
+# 24-bit gradient is emitted as raw VT sequences (Write-Host only knows
+# the 16 console colours). PS 5.1 compatible; row text is single-quoted
+# so the literal "$0" is not treated as a variable.
+function Show-Banner {
+    $utf8 = $false
+    try { $utf8 = ([Console]::OutputEncoding.CodePage -eq 65001) } catch { }
+    if ($env:WAIRED_NO_EMOJI) { $utf8 = $false }
+
+    $tty = $true
+    try { $tty = -not [Console]::IsOutputRedirected } catch { }
+    $useColor = $tty -and (-not $env:NO_COLOR)
+    $vt = $false
+    try { $vt = [bool]$Host.UI.SupportsVirtualTerminal } catch { }
+
+    $cols = 80
+    try { $cols = [int][Console]::WindowWidth } catch { }
+    if ($cols -lt 1) { $cols = 80 }
+
+    if ($utf8 -and $cols -ge 60) {
+        $e = [char]27
+        $rows = @(
+            @(127,233,255,'       ·  ⟨ ● ⟩  ·'),
+            @(72,105,140, '   ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄'),
+            @(143,189,240,' ██╗    ██╗ █████╗ ██╗██████╗ ███████╗██████╗ '),
+            @(140,198,243,' ██║    ██║██╔══██╗██║██╔══██╗██╔════╝██╔══██╗'),
+            @(137,207,246,' ██║ █╗ ██║███████║██║██████╔╝█████╗  ██║  ██║'),
+            @(134,215,249,' ██║███╗██║██╔══██║██║██╔══██╗██╔══╝  ██║  ██║'),
+            @(130,224,252,' ╚███╔███╔╝██║  ██║██║██║  ██║███████╗██████╔╝'),
+            @(127,233,255,'  ╚══╝╚══╝ ╚═╝  ╚═╝╚═╝╚═╝  ╚═╝╚══════╝╚═════╝ '),
+            @(72,105,140, '   ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄'),
+            @(150,160,175,'   Local-first AI gateway  ·  $0 per token'),
+            @(112,120,134,'   Claude Code · OpenCode · OpenClaw — your own machine')
+        )
+        foreach ($r in $rows) {
+            if ($useColor -and $vt) {
+                Write-Host ("{0}[38;2;{1};{2};{3}m{4}{0}[0m" -f $e, $r[0], $r[1], $r[2], $r[3])
+            } elseif ($useColor) {
+                Write-Host $r[3] -ForegroundColor Cyan
+            } else {
+                Write-Host $r[3]
+            }
+        }
+        Write-Host ""
+    } else {
+        $art = @'
+__        ___    ___ ____  _____ ____
+\ \      / / \  |_ _|  _ \| ____|  _ \
+ \ \ /\ / / _ \  | || |_) |  _| | | | |
+  \ V  V / ___ \ | ||  _ <| |___| |_| |
+   \_/\_/_/   \_\___|_| \_\_____|____/
+'@
+        if ($useColor) { Write-Host $art -ForegroundColor Cyan } else { Write-Host $art }
+        Write-Host "   Local-first AI gateway`n"
+    }
 }
 
 # Either run the script-block or, in dry-run mode, print a description.
@@ -107,25 +301,88 @@ function Common-Run {
     & $Action
 }
 
+# ConvertTo-ScriptText normalises an Invoke-WebRequest .Content payload to a
+# string. On Windows PowerShell 5.1 a response served as
+# application/octet-stream (which GitHub uses for raw release assets like
+# install.ps1 / ollama-windows.ps1) comes back as a byte[], not a string;
+# feeding that straight into [ScriptBlock]::Create() or string-interpolating
+# it ("& { $($resp.Content) }") corrupts the script body. Decode bytes as
+# UTF-8 so every fetch-then-run path is byte[]-safe.
+function ConvertTo-ScriptText {
+    param($Content)
+    if ($Content -is [byte[]]) { return [System.Text.Encoding]::UTF8.GetString($Content) }
+    return [string]$Content
+}
+
 function Show-Help {
-@'
+@"
 install.ps1 -- install Waired for Windows.
 
 Usage:
   iwr -useb https://github.com/gen16k/waired-install/releases/latest/download/install.ps1 | iex
 
-  # Or, with options:
-  $script = iwr -useb https://github.com/gen16k/waired-install/releases/latest/download/install.ps1
-  Invoke-Expression "& { $($script.Content) } -DryRun"
+  # Or, with options (save to a file first so -Dev / -Control bind and the
+  # UAC self-elevation re-launches the same file):
+  `$f = "`$env:TEMP\waired-install.ps1"
+  iwr -useb https://github.com/gen16k/waired-install/releases/latest/download/install.ps1 -OutFile `$f
+  & `$f -Dev
 
 Switches:
-  -DryRun   Print every privileged command without executing it.
-  -Help     Print this help.
+  -DryRun           Print every privileged command without executing it.
+  -Dev              Pre-configure for the built-in dogfood Control Plane
+                    ($DevControlUrl); the installer enrols this device
+                    against that CP automatically (UAC + browser sign-in).
+  -Control <URL>    Same as -Dev but with an explicit URL; takes precedence
+                    over -Dev when both are given.
+  -Edge, -Latest    Install the latest main build (same as
+                    WAIRED_VERSION=edge) — rebuilt on every merge to main;
+                    NOT a stable release. Fetches the edge prerelease
+                    assets from the mirror.
+  -SkipOllama       Skip the Ollama install + bundled-model pre-pull
+                    (same as WAIRED_NO_OLLAMA=1).
+  -SkipInit         Skip the post-install `waired init` invocation; finish
+                    with the manual-Next-steps block instead.
+  -SkipClaudeProxy  Don't enable the transparent Claude proxy after enrolment
+                    (default: on -- trusts a local root CA + redirects
+                    api.anthropic.com to local inference). Same as
+                    WAIRED_NO_CLAUDE_PROXY=1.
+  -NonInteractive   Forward `--non-interactive` to `waired init`
+                    (skip the install-time inference role prompts).
+  -Check            Report whether a newer waired is available, then exit.
+                    Read-only: no download and no UAC prompt.
+  -Update           Update an existing install to the latest release for
+                    the active channel (WAIRED_VERSION): stops the
+                    service, swaps the binaries in place, restarts. The
+                    SCM registration and the state/identity under
+                    %ProgramData%\waired are preserved; a reused Ollama is
+                    not touched. Re-running install.ps1 on a host that
+                    already has waired offers this automatically.
+  -Yes              Assume "yes" to the update prompt (required to update
+                    on a non-interactive / no-TTY host).
+  -Help             Print this help.
+
+Parameters:
+  -OllamaGpuMode <mode>      auto | rocm | vulkan | cuda-only | cpu-only
+                             (default: auto)
+  -OllamaModelsDir <path>    Forward to ollama-windows.ps1 -ModelsDir.
+  -InferenceEnabled <bool>   true | false to force `waired init
+                             --inference-enabled`. Empty = prompt.
+  -ShareWithMesh <bool>      true | false to force `waired init
+                             --share-with-mesh`. Empty = prompt.
 
 Environment variables:
-  WAIRED_VERSION           Pin a specific release tag (e.g. v1.2.3). Default: latest.
+  WAIRED_VERSION           Pin a specific release tag (e.g. v1.2.3), or 'edge'
+                           for the latest main build (same as -Edge). Default: latest.
   WAIRED_NO_TRAY           If set, skip waired-tray.exe.
+  WAIRED_NO_OLLAMA         If set, skip the Ollama install (same as -SkipOllama).
+  WAIRED_NO_CLAUDE_PROXY   If set, skip enabling the transparent Claude proxy (same as -SkipClaudeProxy).
   WAIRED_STATE_DIR         Override on-disk state location. Default: %ProgramData%\waired.
+  WAIRED_CONTROL_URL       Control Plane URL used when -Dev / -Control are
+                           not given (lower-priority fallback for per-org
+                           installer wrappers).
+  WAIRED_DEV_CONTROL_URL   Override the URL -Dev resolves to.
+                           Default: https://app.dev.waired.net.
+  WAIRED_OLLAMA_MODELS_DIR -OllamaModelsDir fallback.
   WAIRED_INSTALL_BASE_URL  Override the mirror base URL (tests / staging).
 
 Diagnostics:
@@ -135,7 +392,26 @@ Diagnostics:
 Uninstall:
   - Settings -> Apps -> Waired -> Uninstall (when the GUI installer was used)
   - or: & "C:\Program Files\Waired\waired-agent.exe" uninstall
-'@ | Write-Host
+"@ | Write-Host
+}
+
+# Resolve the Control Plane URL using [-Control > -Dev preset > env]
+# precedence and store it in $script:ControlUrl. An empty result is fine
+# -- Show-NextSteps falls back to a placeholder URL in that case.
+function Resolve-ControlUrl {
+    if ($Control -and $Dev) {
+        Common-Warn "-Control overrides -Dev (both were given)"
+    }
+    if ($Control) {
+        $script:ControlUrl = $Control
+    } elseif ($Dev) {
+        if (-not $DevControlUrl) {
+            Common-Die "-Dev requires WAIRED_DEV_CONTROL_URL but it is empty"
+        }
+        $script:ControlUrl = $DevControlUrl
+    } elseif ($env:WAIRED_CONTROL_URL) {
+        $script:ControlUrl = $env:WAIRED_CONTROL_URL
+    }
 }
 
 # -------------------------------------------------------------------
@@ -186,12 +462,24 @@ function Invoke-SelfElevate {
 
     Common-Log "Privileged step ahead -- requesting UAC..."
 
-    # WAIRED_NO_TRAY / WAIRED_STATE_DIR are read from $env in the
-    # elevated child too -- Start-Process inherits the parent's
-    # environment block. Only the staged zip path and -DryRun need
-    # explicit forwarding.
+    # WAIRED_NO_TRAY / WAIRED_STATE_DIR / WAIRED_CONTROL_URL are read
+    # from $env in the elevated child too -- Start-Process inherits the
+    # parent's environment block. Only switches / explicit values bound
+    # to non-env params need explicit forwarding.
     $passthroughArgs = @('-StagedZipPath', $ZipPath)
-    if ($DryRun) { $passthroughArgs += '-DryRun' }
+    if ($DryRun)         { $passthroughArgs += '-DryRun' }
+    if ($Update)         { $passthroughArgs += '-Update' }
+    if ($Yes)            { $passthroughArgs += '-Yes' }
+    if ($Dev)            { $passthroughArgs += '-Dev' }
+    if ($Control)        { $passthroughArgs += @('-Control', $Control) }
+    if ($SkipOllama)     { $passthroughArgs += '-SkipOllama' }
+    if ($SkipInit)       { $passthroughArgs += '-SkipInit' }
+    if ($SkipClaudeProxy){ $passthroughArgs += '-SkipClaudeProxy' }
+    if ($NonInteractive) { $passthroughArgs += '-NonInteractive' }
+    if ($OllamaGpuMode -and $OllamaGpuMode -ne 'auto') { $passthroughArgs += @('-OllamaGpuMode', $OllamaGpuMode) }
+    if ($OllamaModelsDir)  { $passthroughArgs += @('-OllamaModelsDir',  $OllamaModelsDir) }
+    if ($InferenceEnabled) { $passthroughArgs += @('-InferenceEnabled', $InferenceEnabled) }
+    if ($ShareWithMesh)    { $passthroughArgs += @('-ShareWithMesh',    $ShareWithMesh) }
 
     $psArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass')
     if ($PSCommandPath) {
@@ -207,7 +495,11 @@ function Invoke-SelfElevate {
         $passthroughLiteral = ($passthroughArgs | ForEach-Object {
             if ($_ -match '^-') { $_ } else { "'" + ($_ -replace "'", "''") + "'" }
         }) -join ' '
-        $bootstrap = "`$src = iwr -useb '$url'; Invoke-Expression `"& { `$(`$src.Content) } $passthroughLiteral`""
+        # Decode the fetched body (octet-stream comes back as byte[] on
+        # Windows PowerShell 5.1) before [ScriptBlock]::Create so the elevated
+        # child binds the passthrough params instead of choking on a stringified
+        # byte array.
+        $bootstrap = "`$r = (iwr -useb '$url').Content; if (`$r -is [byte[]]) { `$r = [System.Text.Encoding]::UTF8.GetString(`$r) }; & ([ScriptBlock]::Create(`$r)) $passthroughLiteral"
         $psArgs += @('-Command', $bootstrap)
     }
 
@@ -339,28 +631,472 @@ function Invoke-AgentInstall {
     }
 }
 
+# Test-OllamaInstalled mirrors internal/download/ollama_path_windows.go's
+# discovery order so the installer can skip re-installing Ollama on
+# hosts where waired-agent (LocalSystem) can already find it.
+function Test-OllamaInstalled {
+    $candidates = @(
+        (Join-Path $env:ProgramFiles 'Ollama\ollama.exe'),
+        (Join-Path $env:LOCALAPPDATA 'Programs\Ollama\ollama.exe')
+    )
+    foreach ($c in $candidates) {
+        if (Test-Path -LiteralPath $c) { return $c }
+    }
+    $cmd = Get-Command ollama.exe -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    return $null
+}
+
+# Test-InteractiveStdin reports whether Read-Host will work without
+# wedging. Honours -NonInteractive, then [Console]::IsInputRedirected
+# (CI / `iwr | iex` with a redirected stdin), and falls back to
+# UserInteractive on hosts that don't expose IsInputRedirected.
+function Test-InteractiveStdin {
+    if ($NonInteractive) { return $false }
+    try {
+        return -not [Console]::IsInputRedirected
+    } catch {
+        return [Environment]::UserInteractive
+    }
+}
+
+# Install-OllamaIfRequested fetches scripts/install/ollama-windows.ps1
+# from the same release mirror this installer was downloaded from and
+# runs it inside Phase 2. Only runs when -Control / -Dev resolved a CP
+# URL — without a CP we don't know whether the operator wants this host
+# to run inference at all, and silently dropping ~1.5 GB onto disk
+# would surprise them. Idempotent (the helper script handles existing
+# installs); we still detect them up front and ask before reinstall to
+# avoid an unwanted ~10-min re-download.
+function Install-OllamaIfRequested {
+    if ($SkipOllama) {
+        Common-Log "-SkipOllama set; not touching Ollama."
+        return
+    }
+    if (-not $ControlUrl) {
+        Common-Log "No Control Plane URL resolved -- skipping Ollama install (re-run with -Dev / -Control <URL> to enable)."
+        return
+    }
+
+    $existing = Test-OllamaInstalled
+    if ($existing) {
+        if (-not (Test-InteractiveStdin)) {
+            Common-Log "Ollama already installed at $existing; -NonInteractive / non-TTY -> not reinstalling."
+            return
+        }
+        $reply = Read-Host "[waired] Ollama already installed at $existing. Reinstall / upgrade now? [y/N]"
+        if ($reply -notmatch '^(y|yes)$') {
+            Common-Log "Keeping existing Ollama install."
+            return
+        }
+    }
+
+    $releaseBase = Resolve-ReleaseBase
+    $ollamaScriptUrl = "$releaseBase/ollama-windows.ps1"
+    Common-Log "Fetching $ollamaScriptUrl"
+    $body = $null
+    try {
+        if (-not $DryRun) {
+            $body = ConvertTo-ScriptText (Invoke-WebRequest -Uri $ollamaScriptUrl -UseBasicParsing).Content
+        }
+    } catch {
+        Common-Warn "could not fetch ollama-windows.ps1 ($($_.Exception.Message)); skipping Ollama install. Re-run by hand later: iwr -useb $ollamaScriptUrl | iex"
+        return
+    }
+
+    # Splat a HASHTABLE so these bind to ollama-windows.ps1's param() block
+    # BY NAME. An array splat (@('-GpuMode', $mode)) binds POSITIONALLY:
+    # '-GpuMode' lands in $ZipUrl and the helper tries to download a URL
+    # literally named '-GpuMode' ("remote name could not be resolved").
+    $ollamaArgs = @{ GpuMode = $OllamaGpuMode }
+    if ($OllamaModelsDir) { $ollamaArgs['ModelsDir'] = $OllamaModelsDir }
+    Common-Log ("Installing Ollama (mode={0}{1})..." -f $OllamaGpuMode,
+        ($(if ($OllamaModelsDir) { "; models=$OllamaModelsDir" } else { '' })))
+
+    $ollamaDesc = "ollama-windows.ps1 -GpuMode $OllamaGpuMode" + $(if ($OllamaModelsDir) { " -ModelsDir $OllamaModelsDir" } else { '' })
+    Common-Run $ollamaDesc {
+        if ($DryRun) { return }
+        try {
+            # ScriptBlock::Create + hashtable splat binds the fetched
+            # script's param() block by name. Invoke-Expression would
+            # discard the param() bindings.
+            $script = [ScriptBlock]::Create($body)
+            & $script @ollamaArgs
+        } catch {
+            Common-Warn "Ollama install failed: $($_.Exception.Message); the agent will retry pulling the bundled model at boot."
+        }
+    }
+}
+
+# Invoke-WairedInit runs `waired.exe init` so enrolment happens inside
+# the installer instead of as a manual post-install step. The elevated
+# PS console opened by Start-Process -Verb RunAs has its own stdin, so
+# the OAuth flow and the install-time inference role prompt work
+# normally. State always lives under $AgentStateDir
+# (= %ProgramData%\waired) so the SCM-mode agent picks it up — also
+# side-steps the agent-side state-dir mismatch tracked in issue #113.
+# Only runs when -Control / -Dev resolved a CP URL.
+function Invoke-WairedInit {
+    if ($SkipInit) {
+        Common-Log "-SkipInit set; not running waired init."
+        return $false
+    }
+
+    $exe = Join-Path $InstallDir 'waired.exe'
+    if (-not (Test-Path -LiteralPath $exe)) {
+        Common-Warn "waired.exe not found at $exe; cannot run `waired init`."
+        return $false
+    }
+
+    $stateForInit = if ($StateDir) { $StateDir } else { $AgentStateDir }
+    $initArgs = @('init', '--state-dir', $stateForInit)
+    # waired init self-defaults the Control Plane URL (machine env var /
+    # baked production default), so --control is only passed when we have an
+    # explicit one. This is why init no longer needs a URL to run.
+    if ($ControlUrl) { $initArgs += @('--control', $ControlUrl) }
+    if (-not (Test-InteractiveStdin)) { $initArgs += '--non-interactive' }
+    if ($InferenceEnabled) { $initArgs += @('--inference-enabled', $InferenceEnabled) }
+    if ($ShareWithMesh)    { $initArgs += @('--share-with-mesh',   $ShareWithMesh) }
+
+    Common-Log "Running: $exe $($initArgs -join ' ')"
+    if ($DryRun) {
+        Common-Run "& $exe $($initArgs -join ' ')" { }
+        return $true
+    }
+    & $exe @initArgs
+    if ($LASTEXITCODE -ne 0) {
+        Common-Warn "waired init exited with code $LASTEXITCODE -- enrolment did not complete."
+        Common-Warn "Re-run manually: & `"$exe`" init --state-dir `"$stateForInit`""
+        return $false
+    }
+    return $true
+}
+
 function Show-NextSteps {
-    $cpHint = if ($StateDir) { $StateDir } else { Join-Path $env:ProgramData 'waired' }
+    param([bool]$InitRan = $false)
+    $cpHint  = if ($StateDir) { $StateDir } else { $AgentStateDir }
+    $url     = if ($ControlUrl) { $ControlUrl } else { 'https://your-cp.example.com' }
+    $haveUrl = [bool]$ControlUrl
     Write-Host ''
-    Write-Host 'Waired installed.' -ForegroundColor Green
+    Write-Host "$(Emo '🎉' '*') Waired is installed." -ForegroundColor Green
+    if ($haveUrl) {
+        Write-Host "Control Plane URL: $url" -ForegroundColor Green
+    }
     Write-Host ''
-    Write-Host 'Next steps:'
-    Write-Host '  1. Enroll this device against your Control Plane:'
-    Write-Host "       & `"$InstallDir\waired.exe`" init --control `"https://your-cp.example.com`""
-    Write-Host '     (or right-click the waired-tray icon once it is running and pick "Log in...")'
-    Write-Host '  2. Start the daemon:'
-    Write-Host "       Start-Service $ServiceName"
+    if ($InitRan) {
+        Write-Host "$(Emo '✅' '[ok]') Enrolled - the agent service is running." -ForegroundColor Green
+        Write-Host "  Check it:  & `"$InstallDir\waired.exe`" status   (try: & `"$InstallDir\waired.exe`" infer `"hello, world!`")"
+    } else {
+        Write-Host "$(Emo '🔧' '*') The agent service is running - ready for sign-in."
+        Write-Host "  Sign in:   & `"$InstallDir\waired.exe`" init"
+        Write-Host '             (or right-click the waired-tray icon and pick "Log in...")'
+        Write-Host "  Verify:    & `"$InstallDir\waired.exe`" status"
+    }
+    Write-Host ''
+    Write-Host 'The agent service is enabled at boot and running now.'
     Write-Host ''
     if (-not $NoTray) {
-        Write-Host 'Tray:'
-        Write-Host "  Launch `"$InstallDir\waired-tray.exe`" once from File Explorer or the Start menu."
-        Write-Host '  On first launch it registers itself in HKCU\...\Run so it auto-starts at each logon.'
+        Write-Host "Tray:  launch `"$InstallDir\waired-tray.exe`" once; it auto-starts at each logon."
         Write-Host ''
     }
     Write-Host "State / identity:  $cpHint"
-    Write-Host 'Diagnostics:       Get-WinEvent -ProviderName waired-agent -LogName Application -MaxEvents 20'
+    Write-Host 'Diagnostics:       waired doctor   (logs: Get-WinEvent -ProviderName waired-agent -LogName Application)'
     Write-Host "Uninstall:         & `"$InstallDir\waired-agent.exe`" uninstall"
+    Write-Host 'More:              waired init --help'
+    Write-Host 'Quickstart:        https://github.com/gen16k/waired/blob/main/docs/quickstarts/README.md'
     Write-Host ''
+}
+
+# -------------------------------------------------------------------
+# update_* -- manual update (#292). Mirrors install.sh's --check /
+# --update flow: detect the installed version, resolve the latest for
+# the active channel, gate on a version compare, then swap the binaries
+# in place and restart the service. The version-compare semantics match
+# internal/version (Go) so the installer, `waired update` (#293) and the
+# auto-check (#294) all agree on "is X older than Y".
+# -------------------------------------------------------------------
+
+# ConvertTo-WairedVersion -- parse arbitrary versionish text into a
+# [version]: drop a leading "v", keep the leading dotted-numeric run
+# (so "0.6.3-rc1" -> 0.6.3), pad a bare major ("5" -> 5.0), and return
+# $null when nothing parseable is present. Mirror of install.sh
+# version_strip + the [version] cast.
+function ConvertTo-WairedVersion {
+    param([string]$Text)
+    if (-not $Text) { return $null }
+    $s = $Text.Trim()
+    if ($s -match '^[vV]') { $s = $s.Substring(1) }
+    $m = [regex]::Match($s, '^[0-9]+(\.[0-9]+)*')
+    if (-not $m.Success) { return $null }
+    # Zero-pad to a fixed 4 components so the [version] compare matches
+    # install.sh version_lt (which zero-pads the shorter side). Without
+    # this, [version]"1.2" sorts BELOW [version]"1.2.0": the unspecified
+    # Build/Revision are -1, not 0, so "1.2" and "1.2.0" would compare
+    # unequal. [version] accepts 2..4 components, so cap at 4 and treat
+    # anything longer (not a real waired/Ollama version) as unparseable.
+    $parts = $m.Value.TrimEnd('.').Split('.')
+    if ($parts.Count -gt 4) { return $null }
+    while ($parts.Count -lt 4) { $parts += '0' }
+    try { return [version]($parts -join '.') } catch { return $null }
+}
+
+# Test-WairedOlder -- $true iff $Installed < $Latest. An unparseable /
+# empty $Latest returns $false ("can't tell -> don't offer"); an
+# unparseable / empty $Installed returns $true ("offer the update").
+# Mirror of install.sh version_lt.
+function Test-WairedOlder {
+    param([string]$Installed, [string]$Latest)
+    $b = ConvertTo-WairedVersion $Latest
+    if (-not $b) { return $false }
+    $a = ConvertTo-WairedVersion $Installed
+    if (-not $a) { return $true }
+    return ($a -lt $b)
+}
+
+# Get-InstalledVersion -- the installed waired version, or $null when no
+# binary is present. Primary source is `waired.exe version --json`
+# (.version); falls back to a VERSION file beside the binary, then
+# 'unknown' for a binary too old to report a version (no `version`
+# subcommand -- treated as "older" so the update is offered). Mirror of
+# install.sh darwin_detect_installed.
+function Get-InstalledVersion {
+    $exe = Join-Path $InstallDir 'waired.exe'
+    if (-not (Test-Path -LiteralPath $exe)) { return $null }
+    try {
+        $out = & $exe version --json 2>$null
+        if ($LASTEXITCODE -eq 0 -and $out) {
+            $v = ($out | ConvertFrom-Json).version
+            if ($v) { return [string]$v }
+        }
+    } catch { }
+    $verFile = Join-Path $InstallDir 'VERSION'
+    if (Test-Path -LiteralPath $verFile) {
+        $v = (Get-Content -LiteralPath $verFile -First 1).Trim()
+        if ($v) { return $v }
+    }
+    return 'unknown'
+}
+
+# Get-GitHubLatestTag -- resolve the stable 'latest' release tag via the
+# public mirror's GitHub Releases API. Returns a stripped version (no
+# leading v) or $null on any failure (non-fatal; the caller leaves the
+# install unchanged). Unauthenticated api.github.com (60 req/hr/IP) is
+# plenty for an installer. Mirror of install.sh resolve_latest_version
+# (stable arm).
+function Get-GitHubLatestTag {
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = `
+            [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    } catch { }
+    $api = "https://api.github.com/repos/$InstallRepo/releases/latest"
+    try {
+        $resp = Invoke-RestMethod -Uri $api -UseBasicParsing `
+            -Headers @{ 'User-Agent' = 'waired-installer' }
+        if ($resp.tag_name) { return ([string]$resp.tag_name -replace '^v', '') }
+    } catch {
+        Common-Warn "could not query the latest version ($($_.Exception.Message)); leaving the current install unchanged."
+    }
+    return $null
+}
+
+# Resolve-LatestVersion -- the latest version for the active channel
+# (from WAIRED_VERSION / $Version): unset|latest -> stable (GitHub API),
+# edge -> the moving 'edge' prerelease (compare degrades to "always
+# offer"), explicit vX.Y.Z -> that pin verbatim (no network call).
+# Mirror of install.sh channel_from_env + resolve_latest_version.
+function Resolve-LatestVersion {
+    switch -Regex ($Version) {
+        '^(latest)?$' { return Get-GitHubLatestTag }
+        '^edge$'      { return 'edge' }
+        default       { return ($Version -replace '^v', '') }
+    }
+}
+
+# Confirm-WairedUpdate -- $true to proceed. -Yes forces yes; a
+# non-interactive shell without -Yes reports and declines (safe,
+# reversible); otherwise an interactive [Y/n] prompt defaulting to yes.
+# Mirror of install.sh prompt_update.
+function Confirm-WairedUpdate {
+    param([string]$Installed, [string]$Latest)
+    if ($Yes) { return $true }
+    if (-not (Test-InteractiveStdin)) {
+        Common-Warn "Update available: $Installed -> $Latest. Re-run with -Update -Yes to apply (non-interactive)."
+        return $false
+    }
+    $reply = Read-Host "[waired] Update waired $Installed -> $Latest? [Y/n]"
+    if ($reply -match '^(n|no)$') { return $false }
+    return $true
+}
+
+# Stop-ServiceForUpdate -- stop (but do NOT delete) the waired-agent
+# service so its on-disk binaries can be overwritten in place. Unlike
+# Stop-ExistingService (the fresh-install path, which sc.exe-deletes so
+# `waired-agent install` re-registers from scratch), the update path
+# keeps the SCM registration + state-dir DACL intact -- the binary path
+# is unchanged, so there is nothing to re-register. Returns $true when
+# the service existed.
+function Stop-ServiceForUpdate {
+    $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    if (-not $svc) { return $false }
+    if ($svc.Status -ne 'Stopped') {
+        Common-Log "Stopping $ServiceName for in-place update"
+        Common-Run "Stop-Service $ServiceName" {
+            Stop-Service -Name $ServiceName -Force -ErrorAction Stop
+        }
+    }
+    return $true
+}
+
+# Start-AgentService -- (re)start the service after the swap.
+function Start-AgentService {
+    Common-Run "Start-Service $ServiceName" {
+        Start-Service -Name $ServiceName -ErrorAction Stop
+    }
+}
+
+# Ensure-AgentRunning -- best-effort start of the registered service after a
+# fresh install, regardless of whether init ran. The SCM service is
+# registered StartType=Automatic by `waired-agent install`, and the daemon
+# boots identity-less safely (#177), so starting it now lets a non-admin
+# user finish setup via the tray even when sign-in was skipped. Never
+# aborts the install: a start failure is a warning.
+function Ensure-AgentRunning {
+    if ($DryRun) {
+        Common-Run "Start-Service $ServiceName" { }
+        return
+    }
+    try {
+        Start-Service -Name $ServiceName -ErrorAction Stop
+        Common-Log "$ServiceName is running."
+    } catch {
+        Common-Warn "could not start ${ServiceName}: $_ -- start it with: Start-Service $ServiceName"
+    }
+}
+
+# Enable-ClaudeProxy turns on the transparent Claude proxy via the elevated CLI:
+# it persists desired-proxy=enabled and (re)starts the LocalSystem agent, which
+# converges the Root-store CA, NODE_EXTRA_CA_CERTS, the :443 bind, and the
+# api.anthropic.com hosts redirect (fallback: real Anthropic). Mirrors the Linux
+# installer's default-on proxy. Best-effort: a failure warns but never aborts.
+# Callers gate this on a successful enrolment ($initRan); -SkipClaudeProxy /
+# WAIRED_NO_CLAUDE_PROXY opt out entirely.
+function Enable-ClaudeProxy {
+    if ($SkipClaudeProxy) {
+        Common-Log "-SkipClaudeProxy set; leaving Claude Code routed directly to api.anthropic.com."
+        return
+    }
+    $exe = Join-Path $InstallDir 'waired.exe'
+    if (-not (Test-Path -LiteralPath $exe)) {
+        Common-Warn "waired.exe not found at $exe; skipping Claude proxy setup."
+        return
+    }
+    $stateForProxy = if ($StateDir) { $StateDir } else { $AgentStateDir }
+    Common-Log "Enabling the transparent Claude proxy (trusts a 'waired Claude proxy CA' root certificate; redirects api.anthropic.com -> local inference). Opt out with -SkipClaudeProxy."
+    $proxyArgs = @('proxy', 'install', '--confirm-anthropic', '--state-dir', $stateForProxy)
+    Common-Run "& $exe $($proxyArgs -join ' ')" {
+        & $exe @proxyArgs
+        if ($LASTEXITCODE -ne 0) {
+            Common-Warn "waired proxy install exited with code $LASTEXITCODE; enable later with: & `"$exe`" proxy install --confirm-anthropic"
+        }
+    }
+}
+
+# Show-UpdateResult -- closing summary for the update path.
+function Show-UpdateResult {
+    param([string]$From, [string]$To)
+    Write-Host ''
+    Write-Host ("Waired updated: {0} -> {1}." -f $From, $To) -ForegroundColor Green
+    if (-not $DryRun) {
+        $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+        if ($svc) {
+            Write-Host "Service:  $ServiceName is $($svc.Status)."
+        } else {
+            Write-Host "Service:  $ServiceName is not registered; run `"$InstallDir\waired-agent.exe`" install."
+        }
+    }
+    Write-Host 'Ollama:   managed separately; not modified by update (update a reused engine yourself).'
+    Write-Host "State:    $(if ($StateDir) { $StateDir } else { $AgentStateDir }) (identity/config preserved)."
+    Write-Host ''
+}
+
+# Invoke-WairedUpdate -- Phase 1 (un-elevated) of the update path:
+# detect installed + latest, gate, and on a real update download +
+# verify the zip, then hand the swap to Phase 2 (elevated). -Check is
+# read-only: it reports and returns without a UAC prompt or a download.
+# Mirror of install.sh darwin_update's gate.
+function Invoke-WairedUpdate {
+    param([string]$Installed)
+    Common-Log ("waired (Windows): installed={0} channel={1}" -f `
+        $(if ($Installed) { $Installed } else { 'not installed' }), $Version)
+
+    $latest = Resolve-LatestVersion
+    if (-not $latest) {
+        Common-Warn "could not determine the latest version; nothing to do."
+        return
+    }
+
+    $pinned = [bool]$env:WAIRED_VERSION
+    if (-not $pinned -and $Installed -and $Installed -ne 'unknown' -and -not (Test-WairedOlder $Installed $latest)) {
+        Common-Log "waired $Installed is already up to date."
+        return
+    }
+
+    if ($Check) {
+        Common-Log ("Update available: {0} -> {1}" -f `
+            $(if ($Installed) { $Installed } else { 'not installed' }), $latest)
+        return
+    }
+
+    $from = if ($Installed) { $Installed } else { 'unknown' }
+    if (-not (Confirm-WairedUpdate -Installed $from -Latest $latest)) {
+        Common-Log "Update declined."
+        return
+    }
+
+    # Download + verify un-elevated (zero wasted UAC clicks on a bad
+    # mirror / hash), then elevate just for the in-place swap.
+    $workDir = Join-Path $env:TEMP "waired-update-$([Guid]::NewGuid().ToString('N'))"
+    New-Item -ItemType Directory -Path $workDir -Force | Out-Null
+    try {
+        $stagedZip = Get-AssetWithChecksum -WorkDir $workDir
+        if (Test-Admin) {
+            Invoke-WairedUpdateSwap -StagedZip $stagedZip
+        } else {
+            Invoke-SelfElevate -ZipPath $stagedZip
+        }
+    } finally {
+        Common-Run "Remove-Item -Recurse $workDir" {
+            Remove-Item -LiteralPath $workDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+# Invoke-WairedUpdateSwap -- Phase 2 (elevated) of the update path: stop
+# the service, overwrite the binaries in place (same %ProgramFiles%
+# path, so the SCM registration stays valid), then restart. Falls back
+# to a full `waired-agent install` only when no service was registered.
+# State under %ProgramData%\waired and enrolment are left untouched, and
+# Ollama / `waired init` are NOT re-run (mirror of install.sh
+# darwin_update: swap + restart only).
+function Invoke-WairedUpdateSwap {
+    param([string]$StagedZip)
+    if (-not $DryRun -and -not (Test-Path -LiteralPath $StagedZip)) {
+        Common-Die "staged zip not found at $StagedZip (parent installer may have crashed)"
+    }
+    $before = Get-InstalledVersion
+    $hadService = Stop-ServiceForUpdate
+    Extract-Zip -ZipPath $StagedZip
+    Remove-TrayIfRequested
+    if ($hadService) {
+        Start-AgentService
+    } else {
+        Common-Warn "$ServiceName was not registered; running waired-agent install to register it."
+        Invoke-AgentInstall
+        Start-AgentService
+    }
+    $after = Get-InstalledVersion
+    Show-UpdateResult -From $(if ($before) { $before } else { 'unknown' }) `
+                      -To   $(if ($after)  { $after }  else { 'updated' })
 }
 
 # -------------------------------------------------------------------
@@ -372,7 +1108,20 @@ if ($Help) {
     return
 }
 
+Resolve-ControlUrl
 Detect-Platform
+
+# Welcome banner — Phase 1 only ($StagedZipPath set => elevated Phase 2
+# child, which would otherwise print it a second time).
+if (-not $StagedZipPath) { Show-Banner }
+
+# -Check / -Update, or a bare re-run that detects an existing install,
+# routes through the update flow instead of a fresh install (mirror of
+# install.sh main()'s dispatch). The elevated child carries -Update, so
+# $StagedZipPath being set means "already in Phase 2" -- exclude it from
+# the bare-re-run auto-detect so the child doesn't re-enter Phase 1.
+$installedVersion = Get-InstalledVersion
+$updateRequested  = $Check -or $Update -or ($installedVersion -and -not $StagedZipPath)
 
 # Two phases. Both run the same script, distinguished by whether
 # -StagedZipPath was passed:
@@ -394,6 +1143,14 @@ Detect-Platform
 
 if (-not $StagedZipPath) {
     # ---- Phase 1: un-elevated ----
+    if ($updateRequested) {
+        # -Check is read-only and returns before any download / UAC.
+        # -Update (or a bare re-run on an existing install) gates on the
+        # version compare, then downloads + verifies here and elevates
+        # only for the in-place swap.
+        Invoke-WairedUpdate -Installed $installedVersion
+        return
+    }
     if (Test-Admin) {
         Common-Warn "already running elevated; doing download + install in one go (UAC was unnecessary)"
     }
@@ -409,7 +1166,11 @@ if (-not $StagedZipPath) {
             Extract-Zip -ZipPath $stagedZip
             Remove-TrayIfRequested
             Invoke-AgentInstall
-            Show-NextSteps
+            Install-OllamaIfRequested
+            $initRan = Invoke-WairedInit
+            Ensure-AgentRunning
+            if ($initRan) { Enable-ClaudeProxy }
+            Show-NextSteps -InitRan:$initRan
         } else {
             Invoke-SelfElevate -ZipPath $stagedZip
         }
@@ -433,9 +1194,18 @@ if (-not (Test-Admin)) {
 if (-not (Test-Path -LiteralPath $StagedZipPath)) {
     Common-Die "staged zip not found at $StagedZipPath (parent installer may have crashed)"
 }
+if ($Update) {
+    # Elevated swap-only path (the parent already gated + downloaded).
+    Invoke-WairedUpdateSwap -StagedZip $StagedZipPath
+    return
+}
 Common-Log "elevated phase: installing from $StagedZipPath"
 Stop-ExistingService
 Extract-Zip -ZipPath $StagedZipPath
 Remove-TrayIfRequested
 Invoke-AgentInstall
-Show-NextSteps
+Install-OllamaIfRequested
+$initRan = Invoke-WairedInit
+Ensure-AgentRunning
+if ($initRan) { Enable-ClaudeProxy }
+Show-NextSteps -InitRan:$initRan
