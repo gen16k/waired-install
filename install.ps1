@@ -188,6 +188,7 @@ if ($env:WAIRED_NO_CLAUDE_PROXY) { $SkipClaudeProxy = $true }
 $DevControlUrl = if ($env:WAIRED_DEV_CONTROL_URL) { $env:WAIRED_DEV_CONTROL_URL } `
                  else { 'https://app.dev.waired.net' }
 $ControlUrl    = ''   # resolved by Resolve-ControlUrl after param parsing.
+$InitRan       = $false  # set by Invoke-WairedInit; read by Show-NextSteps.
 
 $InstallDir  = Join-Path $env:ProgramFiles 'Waired'
 $ServiceName = 'waired-agent'
@@ -631,6 +632,29 @@ function Invoke-AgentInstall {
     }
 }
 
+# Add-InstallDirToPath appends $InstallDir to the machine PATH so `waired` and
+# `waired-agent` resolve as bare commands in newly-opened shells (the original
+# install left them callable only by full path). Runs only in the elevated
+# phase -- the machine PATH lives under HKLM. Idempotent: a no-op when the dir
+# is already present (case-insensitive `-contains`). SetEnvironmentVariable with
+# the Machine target broadcasts WM_SETTINGCHANGE, so freshly-launched shells
+# pick it up; shells already open when the installer ran still need a restart.
+function Add-InstallDirToPath {
+    $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+    $entries = @($machinePath -split ';' | Where-Object { $_ -ne '' })
+    if ($entries -contains $InstallDir) {
+        Common-Log "machine PATH already contains $InstallDir"
+        return
+    }
+    Common-Log "Adding $InstallDir to machine PATH (open a new shell to use 'waired')."
+    Common-Run "machine PATH += $InstallDir" {
+        [Environment]::SetEnvironmentVariable(
+            'Path', "$($machinePath.TrimEnd(';'));$InstallDir", 'Machine')
+        # Update this process's PATH too so a same-window retry sees it.
+        $env:PATH = "$($env:PATH.TrimEnd(';'));$InstallDir"
+    }
+}
+
 # Test-OllamaInstalled mirrors internal/download/ollama_path_windows.go's
 # discovery order so the installer can skip re-installing Ollama on
 # hosts where waired-agent (LocalSystem) can already find it.
@@ -737,15 +761,25 @@ function Install-OllamaIfRequested {
 # side-steps the agent-side state-dir mismatch tracked in issue #113.
 # Only runs when -Control / -Dev resolved a CP URL.
 function Invoke-WairedInit {
+    # Records the enrolment outcome in the script-scoped $InitRan flag instead
+    # of returning it. The `& $exe @initArgs` below writes waired.exe's stdout
+    # to the success stream, so a caller that ASSIGNED this function's result
+    # (`$x = Invoke-WairedInit`) would fold that stdout into the value and turn
+    # it into an Object[] -- which then can't bind to [bool]$InitRan in
+    # Show-NextSteps. Keeping the boolean out-of-band lets the callers invoke
+    # this as a bare statement, so waired init's stdout (the actionable
+    # "couldn't reach the Control Plane" hint, the deploy plan, and the
+    # interactive OAuth prompts) reaches the real console untouched.
+    $script:InitRan = $false
     if ($SkipInit) {
         Common-Log "-SkipInit set; not running waired init."
-        return $false
+        return
     }
 
     $exe = Join-Path $InstallDir 'waired.exe'
     if (-not (Test-Path -LiteralPath $exe)) {
         Common-Warn "waired.exe not found at $exe; cannot run `waired init`."
-        return $false
+        return
     }
 
     $stateForInit = if ($StateDir) { $StateDir } else { $AgentStateDir }
@@ -761,15 +795,16 @@ function Invoke-WairedInit {
     Common-Log "Running: $exe $($initArgs -join ' ')"
     if ($DryRun) {
         Common-Run "& $exe $($initArgs -join ' ')" { }
-        return $true
+        $script:InitRan = $true
+        return
     }
     & $exe @initArgs
     if ($LASTEXITCODE -ne 0) {
         Common-Warn "waired init exited with code $LASTEXITCODE -- enrolment did not complete."
         Common-Warn "Re-run manually: & `"$exe`" init --state-dir `"$stateForInit`""
-        return $false
+        return
     }
-    return $true
+    $script:InitRan = $true
 }
 
 function Show-NextSteps {
@@ -800,6 +835,7 @@ function Show-NextSteps {
         Write-Host ''
     }
     Write-Host "State / identity:  $cpHint"
+    Write-Host "PATH:              $InstallDir (added to PATH; open a NEW shell to run 'waired' directly)"
     Write-Host 'Diagnostics:       waired doctor   (logs: Get-WinEvent -ProviderName waired-agent -LogName Application)'
     Write-Host "Uninstall:         & `"$InstallDir\waired-agent.exe`" uninstall"
     Write-Host 'More:              waired init --help'
@@ -1166,8 +1202,13 @@ if (-not $StagedZipPath) {
             Extract-Zip -ZipPath $stagedZip
             Remove-TrayIfRequested
             Invoke-AgentInstall
+            Add-InstallDirToPath
             Install-OllamaIfRequested
-            $initRan = Invoke-WairedInit
+            # Invoke-WairedInit as a bare statement (not assigned) so waired
+            # init's stdout reaches the console; it records the outcome in
+            # $script:InitRan instead of returning it.
+            Invoke-WairedInit
+            $initRan = $script:InitRan
             Ensure-AgentRunning
             if ($initRan) { Enable-ClaudeProxy }
             Show-NextSteps -InitRan:$initRan
@@ -1204,8 +1245,12 @@ Stop-ExistingService
 Extract-Zip -ZipPath $StagedZipPath
 Remove-TrayIfRequested
 Invoke-AgentInstall
+Add-InstallDirToPath
 Install-OllamaIfRequested
-$initRan = Invoke-WairedInit
+# Invoke-WairedInit as a bare statement (not assigned) so waired init's stdout
+# reaches the console; it records the outcome in $script:InitRan.
+Invoke-WairedInit
+$initRan = $script:InitRan
 Ensure-AgentRunning
 if ($initRan) { Enable-ClaudeProxy }
 Show-NextSteps -InitRan:$initRan
