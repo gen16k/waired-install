@@ -56,6 +56,53 @@ GUI alternative on Windows: double-click
 one-liner is the recommended path while Authenticode signing is not
 yet in place.
 
+## Edge (latest main build)
+
+The default one-liner installs the latest **stable** release. To track
+the **edge** channel instead — a build rebuilt on every merge to `main`,
+**not** a stable release — pass `--edge` (Linux/macOS) or `-Edge`
+(Windows), or set `WAIRED_VERSION=edge`. `--latest` / `-Latest` are
+aliases.
+
+Linux / macOS:
+
+```sh
+curl -fsSL https://github.com/gen16k/waired-install/releases/latest/download/install.sh | sh -s -- --edge
+```
+
+Windows — the `iwr | iex` pipeline cannot bind `-Edge` (same `param()`
+limitation as `-DryRun`, see [Inspect before running](#inspect-before-running)),
+so select the channel via the environment first:
+
+```powershell
+$env:WAIRED_VERSION = 'edge'
+iwr -useb https://github.com/gen16k/waired-install/releases/latest/download/install.ps1 | iex
+```
+
+What the edge channel does:
+
+* **Linux** — selects the edge apt suite (`waired-dev-apt-edge`) instead
+  of the stable `waired-dev-apt`, writes
+  `/etc/apt/sources.list.d/waired-edge.list`, and removes the stable
+  source. The two channels are mutually exclusive (a host tracks exactly
+  one), so the switch is clean; `apt` then installs the newest `~edge`
+  build.
+* **macOS / Windows** — fetches assets from the moving `edge` **prerelease**
+  tag instead of the latest `v*` release.
+
+`--edge` is a *channel* selector, not a version pin: it always installs
+the current head of `main`, and re-running it later upgrades to whatever
+is newest on edge.
+
+**Switching back to stable** — re-run the default (no-flag) one-liner
+with `WAIRED_VERSION` unset. edge → stable is a normal upgrade. (The
+reverse, stable → edge, is a downgrade in apt's eyes because an `~edge`
+build sorts below the stable it is based on; `--edge` handles the
+allow-downgrade dance for you.)
+
+> Edge is meant for dogfooding and testing. It can break at any time —
+> use a stable release for anything you depend on.
+
 ## Inspect before running
 
 Linux:
@@ -92,10 +139,11 @@ logged (`[waired] ...`) before it runs.
 
 ## Options
 
-| Flag (Linux) | Flag (Windows) | Effect                                             |
-|--------------|----------------|----------------------------------------------------|
-| `--dry-run`  | `-DryRun`      | Print every privileged command without running it. |
-| `-h`/`--help`| `-Help`        | Print usage and exit.                              |
+| Flag (Linux)          | Flag (Windows)      | Effect                                                                              |
+|-----------------------|---------------------|------------------------------------------------------------------------------------|
+| `--dry-run`           | `-DryRun`           | Print every privileged command without running it.                                 |
+| `--edge` / `--latest` | `-Edge` / `-Latest` | Install the latest `main` build (edge channel) instead of the latest stable release. |
+| `-h`/`--help`         | `-Help`             | Print usage and exit.                                                              |
 
 ## Environment variables
 
@@ -103,7 +151,7 @@ Shared between `install.sh` and `install.ps1`:
 
 | Variable                  | Effect                                                                            |
 |---------------------------|-----------------------------------------------------------------------------------|
-| `WAIRED_VERSION`          | Pin to a specific version (Linux: `waired=1.2.3`; Windows: release tag `v1.2.3`). |
+| `WAIRED_VERSION`          | Pin a specific version (Linux: `waired=1.2.3`; Windows: tag `v1.2.3`), or set to `edge` for the latest `main` build (same as `--edge` / `-Edge`). |
 | `WAIRED_NO_TRAY`          | If non-empty, skip `waired-tray` (Linux). Use on headless servers.                |
 | `WAIRED_INSTALL_BASE_URL` | Override URL hosting the scripts + OS binaries (tests / mirrors).                 |
 
@@ -120,7 +168,7 @@ Linux-only (apt repo metadata):
 | Variable                  | Effect                                                                            |
 |---------------------------|-----------------------------------------------------------------------------------|
 | `WAIRED_APT_BASE_URL`     | Override the apt repo base URL. Default points at the AR project endpoint.        |
-| `WAIRED_APT_SUITE`        | Override the apt suite. Defaults to `waired-dev-apt` (= the AR repository id).    |
+| `WAIRED_APT_SUITE`        | Override the apt suite. Defaults to `waired-dev-apt`; `WAIRED_VERSION=edge` auto-selects `waired-dev-apt-edge`. |
 | `WAIRED_APT_COMPONENT`    | Override the apt component. Defaults to `main`. AR APT format uses `main` today.  |
 | `WAIRED_APT_KEY_URL`      | Override the AR signing-key URL (region-scoped Google-managed key).               |
 
@@ -139,6 +187,11 @@ and the macOS `waired-darwin-{amd64,arm64}.tar.gz` + `.sha256` are
 uploaded as release assets here. This repository hosts the installer
 entrypoints (`install.sh`, `install.ps1`) and — for Windows and
 macOS — the binary artifacts themselves.
+
+The moving `edge` **prerelease** tag carries the latest-`main`-build
+assets for the [edge channel](#edge-latest-main-build); GitHub's
+`releases/latest` never resolves to it, so the stable one-liner is
+unaffected.
 
 ## After install
 
