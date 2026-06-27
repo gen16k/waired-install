@@ -1,9 +1,14 @@
 # waired-install
 
-Entrypoint installers for **Waired**:
+Public distribution point for **Waired**'s install / uninstall
+entrypoints and the Windows / macOS binary artifacts. The scripts are
+developed in the upstream Waired repository and published here as
+**release assets** — run them straight from the
+`releases/latest/download/…` URLs below. This repository itself carries
+only this README and the license, not the script sources.
 
-* `install.sh` — Linux (Debian / Ubuntu apt) and macOS 13+ (arm64/amd64).
-* `install.ps1` — Windows 10 1809+ / 11 (PowerShell 5.1+).
+* `install.sh` / `uninstall.sh` — Linux (Debian / Ubuntu apt) and macOS 13+ (arm64/amd64).
+* `install.ps1` / `uninstall.ps1` — Windows 10 1809+ / 11 (PowerShell 5.1+).
 
 ## Quick install
 
@@ -103,6 +108,48 @@ allow-downgrade dance for you.)
 > Edge is meant for dogfooding and testing. It can break at any time —
 > use a stable release for anything you depend on.
 
+## Uninstall
+
+Matching uninstallers ship in every release. By default they remove the
+binaries and unregister the background service but **keep** your config
+and state (enrollment, identity, settings) so a re-install resumes where
+you left off.
+
+Linux / macOS:
+
+```sh
+curl -fsSL https://github.com/gen16k/waired-install/releases/latest/download/uninstall.sh | sh
+```
+
+Windows (self-elevates via UAC):
+
+```powershell
+iwr -useb https://github.com/gen16k/waired-install/releases/latest/download/uninstall.ps1 | iex
+```
+
+For a **full wipe** — also delete config + state, the apt source the
+installer added, the legacy Claude-proxy trust, and Ollama (binary / app
++ downloaded models) — add `--clean` (Linux/macOS) or `-Clean` (Windows).
+It is destructive and asks to confirm first; pass `--yes` / `-Yes` to skip
+the prompt (required on a non-interactive / piped shell), or `--dry-run` /
+`-DryRun` to preview without changing anything.
+
+```sh
+curl -fsSL https://github.com/gen16k/waired-install/releases/latest/download/uninstall.sh | sh -s -- --clean
+```
+
+```powershell
+# -Clean needs the script on disk (iex strips named parameters):
+iwr -useb https://github.com/gen16k/waired-install/releases/latest/download/uninstall.ps1 -OutFile uninstall.ps1
+.\uninstall.ps1 -Clean
+```
+
+The two tiers map to apt's split: the default is `apt remove` (keeps
+`/etc/waired` + `/var/lib/waired`), `--clean` is `apt purge` plus repo
+cleanup. If you installed Waired with the Windows GUI installer
+(`WairedSetup-*.exe`), you can also remove it from **Settings → Apps →
+Waired → Uninstall**; the script is safe to run either way.
+
 ## Inspect before running
 
 Linux:
@@ -184,9 +231,12 @@ Each `v*` tag in this repository corresponds to a Waired release of the
 same version. The Linux `.deb` packages are distributed via Google
 Artifact Registry; the Windows `.zip` + `.sha256` + Inno Setup `.exe`
 and the macOS `waired-darwin-{amd64,arm64}.tar.gz` + `.sha256` are
-uploaded as release assets here. This repository hosts the installer
-entrypoints (`install.sh`, `install.ps1`) and — for Windows and
-macOS — the binary artifacts themselves.
+uploaded as release assets here. Each release also carries the install /
+uninstall entrypoints (`install.sh`, `install.ps1`, `uninstall.sh`,
+`uninstall.ps1`) as assets — the one-liner URLs above resolve to them.
+The scripts themselves are maintained in the upstream Waired repository
+and mirrored here per release; this repo holds no script sources of its
+own.
 
 The moving `edge` **prerelease** tag carries the latest-`main`-build
 assets for the [edge channel](#edge-latest-main-build); GitHub's
@@ -202,7 +252,7 @@ unaffected.
 * Start the daemon: `sudo systemctl enable --now waired-agent`.
 
 Diagnostics:  `journalctl -u waired-agent -e`
-Uninstall:    `sudo apt purge waired waired-tray`
+Uninstall:    `curl -fsSL https://github.com/gen16k/waired-install/releases/latest/download/uninstall.sh | sh` (see [Uninstall](#uninstall); `--clean` also purges `/etc/waired` + `/var/lib/waired`)
 
 ### macOS
 
@@ -213,7 +263,7 @@ Uninstall:    `sudo apt purge waired waired-tray`
   so the `127.0.0.1:11434` server starts. The agent reuses it.
 
 Diagnostics:  `log show --predicate 'process == "waired-agent"' --last 5m`
-Uninstall:    `waired-agent uninstall && sudo rm -f /usr/local/bin/waired /usr/local/bin/waired-agent`
+Uninstall:    `curl -fsSL https://github.com/gen16k/waired-install/releases/latest/download/uninstall.sh | sh` (see [Uninstall](#uninstall); `--clean` also removes state + Ollama)
 
 ### Windows
 
@@ -228,7 +278,7 @@ Uninstall:    `waired-agent uninstall && sudo rm -f /usr/local/bin/waired /usr/l
 * Tray: launch `C:\Program Files\Waired\waired-tray.exe` once from File Explorer or the Start menu. On first launch it registers itself in `HKCU\...\Run` so it auto-starts at each logon.
 
 Diagnostics:  `Get-WinEvent -ProviderName waired-agent -LogName Application -MaxEvents 20`
-Uninstall:    `& "C:\Program Files\Waired\waired-agent.exe" uninstall` (or Settings → Apps → Waired → Uninstall if you used the Inno Setup GUI installer)
+Uninstall:    `iwr -useb https://github.com/gen16k/waired-install/releases/latest/download/uninstall.ps1 | iex` (see [Uninstall](#uninstall); download + `-Clean` to also wipe state, or Settings → Apps → Waired → Uninstall if you used the Inno Setup GUI installer)
 
 ## Supported targets today
 
